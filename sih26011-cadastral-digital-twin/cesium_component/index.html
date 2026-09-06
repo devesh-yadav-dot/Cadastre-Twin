@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <script>
+    window.CESIUM_BASE_URL = "https://cesium.com/downloads/cesiumjs/releases/1.115/Build/Cesium/";
+  </script>
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.115/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.115/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+  <style>
+    html, body, #cesiumContainer {
+      width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; background: transparent;
+    }
+    #cesium-bg-video {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; z-index: 0; pointer-events: none; background: #070B14;
+    }
+    #cesium-bg-overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(7, 11, 20, 0.55); z-index: 1; pointer-events: none;
+    }
+    #cesiumContainer { position: relative; z-index: 2; }
+    #infobox {
+      position: absolute; top: 16px; right: 16px;
+      background: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      color: #F8FAFC;
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-left: 4px solid #00F0FF;
+      padding: 14px 18px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 12px;
+      pointer-events: none;
+      min-width: 260px;
+      display: none;
+      z-index: 9999;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.6);
+    }
+    .hud-header { font-size: 10px; color: #38BDF8; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 4px; font-weight: bold; }
+    .hud-title { font-size: 14px; font-weight: bold; color: #FFFFFF; margin-bottom: 8px; }
+    .hud-row { display: flex; justify-content: space-between; margin-bottom: 3px; }
+    .hud-label { color: #94A3B8; }
+    .hud-val { color: #E2E8F0; font-weight: 600; }
+    #cursor-readout {
+      position:absolute; left:16px; bottom:16px; z-index:9999;
+      background:rgba(15,23,42,.92); color:#CBD5E1; border:1px solid #334155;
+      padding:7px 10px; border-radius:4px; font:11px monospace;
+      pointer-events:none;
+    }
+    #north-cue {
+      position:absolute; right:18px; bottom:18px; z-index:9999;
+      width:34px; height:34px; border:1px solid #475569; border-radius:50%;
+      background:rgba(15,23,42,.9); color:#F8FAFC; display:flex;
+      align-items:center; justify-content:center; font:bold 12px monospace;
+      pointer-events:none;
+    }
+  </style>
+</head>
+<body>
+  <video id="cesium-bg-video" autoplay muted loop playsinline preload="auto">
+    <source src="background.mp4" type="video/mp4">
+  </video>
+  <div id="cesium-bg-overlay"></div>
+  <div id="cesiumContainer"></div>
+  <div id="infobox"></div><div id="cursor-readout">E — — —  N — — —  Z — — —</div><div id="north-cue">N</div>
+
+  <script>
+    function sendToStreamlit(value) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: value
+      }, "*");
+    }
+
+    function setFrameHeight(height) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setFrameHeight",
+        height: height
+      }, "*");
+    }
+
+    let viewer = null;
+
+
+    // ---------------------------------------------------------------------
+    // Procedural architectural dressing
+    // Adds small, deterministic details so LiDAR-derived volumes read as
+    // actual Indian urban buildings without changing the reconstruction data.
+    // ---------------------------------------------------------------------
+    function metersToLon(m, lat) {
+      return m / (111320.0 * Math.cos(Cesium.Math.toRadians(lat)));
+    }
+    function metersToLat(m) {
+      return m / 110540.0;
+    }
+
+    function addArchitecturalDetails(item) {
+      if (!viewer || item.level !== "CITY" || item.h < 3.0) return;
+
+      const lat = item.lat;
+      const lon = item.lon;
+      const z0 = item.base_z;
+      const floors = Math.max(1, Math.round((item.metadata && parseFloat(item.metadata["Floors"])) || item.h / 3.1));
+      const floorH = item.h / floors;
+
+      // Keep details from exploding the entity count on a city-scale view.
+      const maxFloors = Math.min(floors, 8);
+      const frontCols = Math.max(2, Math.min(6, Math.round(item.w / 3.2)));
+      const sideCols = Math.max(2, Math.min(5, Math.round(item.d / 3.2)));
+
+      const wallColor = Cesium.Color.fromCssColorString("#111827").withAlpha(0.96);
+      const glassColor = Cesium.Color.fromCssColorString("#172B3A").withAlpha(0.92);
+      const frameColor = Cesium.Color.fromCssColorString("#64748B").withAlpha(0.75);
+
+      function addBox(id, x, y, z, w, d, h, material, outline=false) {
+        viewer.entities.add({
+          id: id,
+          position: Cesium.Cartesian3.fromDegrees(
+            lon + metersToLon(x, lat),
+            lat + metersToLat(y),
+            z
+          ),
+          box: {
+            dimensions: new Cesium.Cartesian3(Math.max(0.08,w), Math.max(0.08,d), Math.max(0.08,h)),
+            material: material,
+            outline: outline,
+            outlineColor: frameColor,
+            shadows: Cesium.ShadowMode.ENABLED
+          }
+        });
+      }
+
+      // Windows on two opposing facades. The dark recess + slim frame makes
+      // a plain extruded box read much more like a finished building.
+      for (let f = 0; f < maxFloors; f++) {
+        const z = z0 + f * floorH + floorH * 0.53;
+        const wy = Math.min(0.08, item.d * 0.025);
+        const wz = Math.max(0.65, Math.min(1.15, floorH * 0.42));
+
+        for (let c = 0; c < frontCols; c++) {
+          const x = ((c + 0.5) / frontCols - 0.5) * Math.max(1.0, item.w - 0.7);
+          const ww = Math.min(1.55, Math.max(0.55, item.w / frontCols * 0.48));
+          addBox(`win-f-${item.id}-${f}-${c}`, x, -item.d/2 - 0.035, z, ww, wy, wz, glassColor);
+          // shallow sill
+          addBox(`sill-f-${item.id}-${f}-${c}`, x, -item.d/2 - 0.075, z - wz/2 - 0.055, ww + 0.12, 0.12, 0.08, frameColor);
+        }
+
+        for (let c = 0; c < sideCols; c++) {
+          const y = ((c + 0.5) / sideCols - 0.5) * Math.max(1.0, item.d - 0.7);
+          const ww = Math.min(1.35, Math.max(0.5, item.d / sideCols * 0.45));
+          addBox(`win-s-${item.id}-${f}-${c}`, -item.w/2 - 0.035, y, z, wy, ww, wz, glassColor);
+        }
+      }
+
+      // Balconies on a subset of floors, staggered for a more organic facade.
+      if (item.w > 5.0 && item.d > 4.0) {
+        const balconyCount = Math.min(3, Math.max(1, Math.floor(item.w / 7)));
+        for (let b = 0; b < balconyCount; b++) {
+          const f = Math.min(maxFloors - 1, 1 + ((b * 2 + (item.id.length % 3)) % Math.max(1, maxFloors - 1)));
+          const x = ((b + 0.5) / balconyCount - 0.5) * Math.max(1.0, item.w - 2.0);
+          const z = z0 + f * floorH + floorH * 0.18;
+          addBox(`balcony-slab-${item.id}-${b}`, x, -item.d/2 - 0.48, z, Math.min(3.2, item.w*0.45), 0.95, 0.16, wallColor);
+          addBox(`balcony-rail-${item.id}-${b}`, x, -item.d/2 - 0.91, z + 0.55, Math.min(3.0, item.w*0.40), 0.07, 1.05, frameColor);
+        }
+      }
+
+      // Rooftop parapet and equipment plinth.
+      addBox(`roof-cap-${item.id}`, 0, 0, z0 + item.h + 0.10, item.w + 0.16, item.d + 0.16, 0.20, wallColor);
+      if (item.w > 5 && item.d > 5) {
+        addBox(`roof-room-${item.id}`, item.w*0.16, item.d*0.08, z0 + item.h + 0.75,
+               Math.min(2.5,item.w*0.32), Math.min(2.2,item.d*0.30), 1.1,
+               Cesium.Color.fromCssColorString("#CBD5E1"));
+      }
+
+      // Black rooftop water tank + small support stand — common visual cue
+      // for dense Indian residential/commercial blocks.
+      if (item.h > 5.5) {
+        const tankR = Math.min(0.85, Math.max(0.42, Math.min(item.w,item.d)*0.055));
+        viewer.entities.add({
+          id: `tank-${item.id}`,
+          position: Cesium.Cartesian3.fromDegrees(
+            lon + metersToLon(item.w*0.22, lat),
+            lat + metersToLat(item.d*0.18),
+            z0 + item.h + 1.65
+          ),
+          cylinder: {
+            length: 1.25,
+            topRadius: tankR * 0.92,
+            bottomRadius: tankR,
+            material: Cesium.Color.fromCssColorString("#0B1220"),
+            outline: true,
+            outlineColor: Cesium.Color.fromCssColorString("#475569"),
+            shadows: Cesium.ShadowMode.ENABLED
+          }
+        });
+      }
+
+      // A few external AC units, mostly on medium/large buildings.
+      if (item.w > 7 && item.h > 7) {
+        const acN = Math.min(3, Math.floor(item.w / 5));
+        for (let a = 0; a < acN; a++) {
+          const x = ((a + 0.5) / acN - 0.5) * (item.w - 1.2);
+          const floor = 1 + ((a + item.id.length) % Math.max(1, maxFloors - 1));
+          const z = z0 + floor * floorH + floorH * 0.45;
+          addBox(`ac-${item.id}-${a}`, x, -item.d/2 - 0.13, z, 0.62, 0.24, 0.45,
+                 Cesium.Color.fromCssColorString("#E5E7EB"), true);
+        }
+      }
+    }
+
+    function initializeCesium(data) {
+      if (!data) return;
+
+      if (!viewer) {
+        const darkBasemap = new Cesium.UrlTemplateImageryProvider({
+          url: "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
+          maximumLevel: 19
+        });
+
+        viewer = new Cesium.Viewer("cesiumContainer", {
+          imageryProvider: darkBasemap,
+          baseLayerPicker: false,
+          geocoder: false,
+          homeButton: false,
+          infoBox: false,
+          sceneModePicker: false,
+          selectionIndicator: false,
+          timeline: false,
+          animation: false,
+          navigationHelpButton: false,
+          shadows: true,
+          terrainShadows: Cesium.ShadowMode.ENABLED,
+          contextOptions: {
+            webgl: { alpha: true }
+          }
+        });
+
+        const scene = viewer.scene;
+        scene.highDynamicRange = true;
+        scene.globe.enableLighting = true;
+        scene.globe.depthTestAgainstTerrain = false;
+        scene.globe.showGroundAtmosphere = true;
+
+        // Let the background video show through instead of the default
+        // opaque canvas fill / skybox / atmosphere haze.
+        scene.backgroundColor = Cesium.Color.TRANSPARENT;
+        scene.skyBox.show = false;
+        scene.skyAtmosphere.show = false;
+        scene.sun.show = false;
+        scene.moon.show = false;
+
+        // The globe/basemap itself is a separate opaque surface that fills
+        // almost the whole view at street level — make it translucent too
+        // so the video bleeds through the ground. Buildings (entities) are
+        // unaffected and stay fully solid. Globe picking (cursor readout)
+        // still works with translucency enabled.
+        scene.globe.translucency.enabled = true;
+        scene.globe.translucency.frontFaceAlpha = 0.35;
+
+        const bgVideo = document.getElementById("cesium-bg-video");
+        if (bgVideo) {
+          const startBgVideo = () => {
+            const p = bgVideo.play();
+            if (p !== undefined) p.catch(() => {});
+          };
+          startBgVideo();
+          document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) startBgVideo();
+          });
+        }
+        scene.fog.enabled = true;
+        scene.fog.density = 0.00018;
+        scene.fog.minimumBrightness = 0.08;
+        scene.shadowMap.enabled = true;
+        scene.shadowMap.softShadows = true;
+        scene.shadowMap.darkness = 0.55;
+
+        if (scene.postProcessStages && scene.postProcessStages.bloom) {
+          scene.postProcessStages.bloom.enabled = true;
+          scene.postProcessStages.bloom.uniforms.contrast = 115;
+          scene.postProcessStages.bloom.uniforms.brightness = -0.25;
+        }
+
+        viewer.clock.currentTime = Cesium.JulianDate.fromIso8601("2026-09-02T11:30:00Z");
+
+        const infobox = document.getElementById("infobox");
+        const handler = new Cesium.ScreenSpaceEventHandler(scene.canvas);
+
+        handler.setInputAction(function(movement) {
+            updateCursorReadout(movement.endPosition);
+          const picked = scene.pick(movement.endPosition);
+          if (Cesium.defined(picked) && picked.id && picked.id.properties) {
+            const props = picked.id.properties;
+            let html = `<div class="hud-header">3D Cadastre // ISO 19152</div>`;
+            html += `<div class="hud-title">${picked.id.name}</div>`;
+            props.propertyNames.forEach(p => {
+              if (!p.startsWith("_")) {
+                html += `<div class="hud-row"><span class="hud-label">${p}:</span> <span class="hud-val">${props[p].getValue()}</span></div>`;
+              }
+            });
+            infobox.innerHTML = html;
+            infobox.style.display = "block";
+          } else {
+            infobox.style.display = "none";
+          }
+        }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+        handler.setInputAction(function() {
+          resetCamera();
+        }, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+
+        handler.setInputAction(function() {
+          document.getElementById("infobox").style.display = "none";
+        }, Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+
+        handler.setInputAction(function(click) {
+          const picked = scene.pick(click.position);
+          if (Cesium.defined(picked) && picked.id && picked.id.properties) {
+            const targetId = picked.id.properties._rawId.getValue();
+            const level = picked.id.properties._rawLevel.getValue();
+            if (level !== "DETAIL") {
+              sendToStreamlit({ clicked_id: targetId, level: level });
+            }
+          }
+        }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+      }
+
+      viewer.entities.removeAll();
+
+      // 1. GROUND CLASSIFICATION SURFACE (Class 2)
+      if (data.ground && data.show_ground) {
+        data.ground.forEach(item => {
+          viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.z + item.h / 2),
+            box: {
+              dimensions: new Cesium.Cartesian3(item.w, item.d, item.h),
+              material: Cesium.Color.fromCssColorString(item.color || "#1E293B"),
+              shadows: Cesium.ShadowMode.RECEIVE_ONLY
+            }
+          });
+        });
+      }
+
+      // 2. URBAN VEGETATION
+      if (data.vegetation && data.show_vegetation) {
+        data.vegetation.forEach(veg => {
+          viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(veg.lon, veg.lat, veg.z + (veg.h * 0.35) / 2),
+            cylinder: {
+              length: veg.h * 0.35,
+              topRadius: 0.15,
+              bottomRadius: 0.22,
+              material: Cesium.Color.fromCssColorString("#451A03"),
+              shadows: Cesium.ShadowMode.ENABLED
+            }
+          });
+          viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(veg.lon, veg.lat, veg.z + veg.h * 0.65),
+            cylinder: {
+              length: veg.h * 0.65,
+              topRadius: veg.radius * 0.3,
+              bottomRadius: veg.radius,
+              material: Cesium.Color.fromCssColorString(veg.color),
+              shadows: Cesium.ShadowMode.ENABLED
+            }
+          });
+        });
+      }
+
+      // 3. INFRASTRUCTURE
+      if (data.infrastructure && data.render_mode === "REALISTIC") {
+        data.infrastructure.forEach(item => {
+          viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.z + item.h / 2),
+            box: {
+              dimensions: new Cesium.Cartesian3(item.w, item.d, item.h),
+              material: Cesium.Color.fromCssColorString(item.color),
+              shadows: Cesium.ShadowMode.RECEIVE_ONLY
+            }
+          });
+        });
+      }
+
+      // 4. URBAN CLUTTER
+      if (data.clutter && data.render_mode === "REALISTIC") {
+        data.clutter.forEach(item => {
+          let clutterMat = Cesium.Color.fromCssColorString(item.color);
+          if (item.texture_url) {
+            clutterMat = new Cesium.ImageMaterialProperty({
+              image: item.texture_url,
+              repeat: new Cesium.Cartesian2(item.repeat_x || 1.0, item.repeat_y || 1.0)
+            });
+          }
+
+          if (item.shape === "cylinder") {
+            viewer.entities.add({
+              position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.z + item.h / 2),
+              cylinder: {
+                length: item.h,
+                topRadius: item.radius,
+                bottomRadius: item.radius,
+                material: clutterMat,
+                shadows: Cesium.ShadowMode.ENABLED
+              }
+            });
+          } else if (item.shape === "box") {
+            viewer.entities.add({
+              position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.z + item.h / 2),
+              box: {
+                dimensions: new Cesium.Cartesian3(item.w, item.d, item.h),
+                material: clutterMat,
+                shadows: Cesium.ShadowMode.ENABLED
+              }
+            });
+          }
+        });
+      }
+
+      // 5. BUILDINGS & VOLUMETRIC PARCELS
+      if (data.boxes) {
+        const isBuildingView = data.boxes.some(b => b.level === "FLOOR" || b.level === "DETAIL");
+
+        data.boxes.forEach(item => {
+          const isSelected = item.is_selected;
+          let displayColor = Cesium.Color.fromCssColorString(item.color);
+
+          // Analytic Shading Modes
+          if (data.render_mode === "LIDAR_ELEVATION") {
+            const normH = Math.min(1.0, Math.max(0.0, item.h / 28.0));
+            displayColor = Cesium.Color.fromHsl(0.68 - normH * 0.68, 1.0, 0.5);
+          } else if (data.render_mode === "CADASTRAL_LADM") {
+            const tenure = (item.metadata && item.metadata["Tenure Class"]) || "";
+            if (tenure.includes("Freehold")) displayColor = Cesium.Color.fromCssColorString("#10B981");
+            else if (tenure.includes("Lease")) displayColor = Cesium.Color.fromCssColorString("#F59E0B");
+            else displayColor = Cesium.Color.fromCssColorString("#6366F1");
+          } else if (data.render_mode === "STRUCTURAL_XRAY") {
+            displayColor = isSelected ? Cesium.Color.fromCssColorString("#00F0FF").withAlpha(0.65)
+                                      : Cesium.Color.fromCssColorString("#38BDF8").withAlpha(0.35);
+          } else if (data.render_mode === "DENSITY_FAR") {
+            const floors = parseInt((item.metadata && item.metadata["Floors"]) || "1");
+            displayColor = Cesium.Color.fromHsl(0.35 - (floors / 8.0) * 0.35, 1.0, 0.5);
+          } else if (data.render_mode === "OWNERSHIP_STATUS") {
+            const statusColors = {
+              "Verified": "#10B981", "Pending": "#F59E0B", "Disputed": "#EF4444",
+              "Government": "#6366F1", "Vacant": "#64748B", "Commercial": "#38BDF8"
+            };
+            const status = (item.metadata && item.metadata["Status"]) || "Verified";
+            displayColor = Cesium.Color.fromCssColorString(statusColors[status] || "#94A3B8");
+          }
+
+          // Material Assignment with Photographic Texture & Fallback
+          let entityMaterial;
+          if (data.render_mode === "REALISTIC") {
+            if (item.texture_url) {
+              // 1. Primary: Use photographic texture slice
+              entityMaterial = new Cesium.ImageMaterialProperty({
+                image: item.texture_url,
+                repeat: new Cesium.Cartesian2(item.repeat_x || 1.0, item.repeat_y || 1.0)
+              });
+            } else if (item.level === "FLOOR") {
+              // 2. Fallback: Procedural fenestration bands
+              entityMaterial = new Cesium.StripeMaterialProperty({
+                evenColor: Cesium.Color.fromCssColorString(item.color).withAlpha(0.92),
+                oddColor: Cesium.Color.fromCssColorString("#0F172A").withAlpha(0.85),
+                repeat: 4.0,
+                orientation: Cesium.StripeOrientation.HORIZONTAL
+              });
+            } else {
+              // 3. Fallback: Tinted procedural solid
+              entityMaterial = isSelected 
+                ? Cesium.Color.fromCssColorString("#00F0FF").withAlpha(0.95)
+                : displayColor.withAlpha(item.alpha || 0.95);
+            }
+          } else {
+            // Analytical Modes
+            entityMaterial = isSelected 
+              ? Cesium.Color.fromCssColorString("#00F0FF").withAlpha(0.95)
+              : displayColor.withAlpha(item.alpha || 0.95);
+          }
+
+          viewer.entities.add({
+            id: item.id,
+            name: item.name,
+            position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.base_z + item.h / 2),
+            box: {
+              dimensions: new Cesium.Cartesian3(item.w, item.d, item.h),
+              material: entityMaterial,
+              outline: !item.texture_url || isSelected,
+              outlineColor: isSelected 
+                ? Cesium.Color.WHITE 
+                : (item.level === "DETAIL" ? Cesium.Color.BLACK.withAlpha(0.5) : displayColor.brighten(0.3, new Cesium.Color()).withAlpha(0.65)),
+              outlineWidth: isSelected ? 3 : 1,
+              shadows: Cesium.ShadowMode.ENABLED
+            },
+            properties: {
+              ...item.metadata,
+              _rawLevel: item.level,
+              _rawId: item.id
+            }
+          });
+
+          // Rooftop Terrace Parapet Cap
+          if (data.render_mode === "REALISTIC" && item.level === "CITY") {
+            viewer.entities.add({
+              position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.base_z + item.h + 0.35),
+              box: {
+                dimensions: new Cesium.Cartesian3(item.w + 0.2, item.d + 0.2, 0.7),
+                material: item.roof_texture_url ? new Cesium.ImageMaterialProperty({
+                  image: item.roof_texture_url,
+                  repeat: new Cesium.Cartesian2(2.0, 2.0)
+                }) : Cesium.Color.fromCssColorString(item.roof_color || "#334155"),
+                outline: true,
+                outlineColor: Cesium.Color.fromCssColorString("#1E293B"),
+                shadows: Cesium.ShadowMode.ENABLED
+              }
+            });
+          }
+        });
+
+        // 5.5 ANALYTICAL OVERLAYS (additive) — encroachment, unauthorized
+        // construction, disaster simulation, LiDAR confidence heatmap,
+        // underground infrastructure, dispute claims, change detection,
+        // time machine, urban asset layers. Empty arrays by default, so the
+        // original pipeline above is fully unaffected when unused.
+        if (data.overlay_boxes && data.overlay_boxes.length) {
+          data.overlay_boxes.forEach(item => {
+            viewer.entities.add({
+              id: "overlay-" + (item.id || Cesium.createGuid()),
+              name: item.name || "Overlay",
+              position: Cesium.Cartesian3.fromDegrees(item.lon, item.lat, item.base_z + item.h / 2),
+              box: {
+                dimensions: new Cesium.Cartesian3(item.w, item.d, item.h),
+                material: Cesium.Color.fromCssColorString(item.color).withAlpha(item.alpha != null ? item.alpha : 0.55),
+                outline: true,
+                outlineColor: Cesium.Color.fromCssColorString(item.outline_color || item.color),
+                outlineWidth: 2,
+                shadows: Cesium.ShadowMode.DISABLED
+              },
+              properties: {
+                ...(item.metadata || {}),
+                _rawLevel: "OVERLAY",
+                _rawId: item.id || ""
+              }
+            });
+          });
+        }
+
+        if (data.overlay_points && data.overlay_points.length) {
+          data.overlay_points.forEach(pt => {
+            viewer.entities.add({
+              position: Cesium.Cartesian3.fromDegrees(pt.lon, pt.lat, (pt.z || 0)),
+              ellipsoid: {
+                radii: new Cesium.Cartesian3(pt.radius || 1.5, pt.radius || 1.5, (pt.radius || 1.5) * 0.25),
+                material: Cesium.Color.fromCssColorString(pt.color).withAlpha(pt.alpha != null ? pt.alpha : 0.6),
+                outline: false
+              }
+            });
+          });
+        }
+
+        const target = Cesium.Cartesian3.fromDegrees(data.target_lon, data.target_lat, isBuildingView ? 12.0 : 0.0);
+        const pitchAngle = isBuildingView ? -26.0 : -38.0;
+        const headingAngle = isBuildingView ? 45.0 : 25.0;
+
+        viewer.camera.flyToBoundingSphere(
+          new Cesium.BoundingSphere(target, data.target_range),
+          {
+            offset: new Cesium.HeadingPitchRange(
+              Cesium.Math.toRadians(headingAngle),
+              Cesium.Math.toRadians(pitchAngle),
+              data.target_range * 1.15
+            ),
+            duration: 0.8
+          }
+        );
+      }
+
+      setFrameHeight(680);
+    }
+
+
+    // ---------------------------------------------------------------------
+    // SIH26011 field-navigation helpers
+    // ---------------------------------------------------------------------
+    function updateCursorReadout(position) {
+      if (!viewer) return;
+      const ray = viewer.camera.getPickRay(position);
+      const cart = viewer.scene.globe.pick(ray, viewer.scene);
+      const el = document.getElementById("cursor-readout");
+      if (!cart) { el.innerHTML = "E — — —  N — — —  Z — — —"; return; }
+      const c = Cesium.Cartographic.fromCartesian(cart);
+      const lon = Cesium.Math.toDegrees(c.longitude).toFixed(6);
+      const lat = Cesium.Math.toDegrees(c.latitude).toFixed(6);
+      const z = c.height.toFixed(1);
+      el.innerHTML = `E ${lon}° &nbsp; N ${lat}° &nbsp; Z ${z} m`;
+    }
+
+    function resetCamera() {
+      if (!viewer) return;
+      viewer.camera.flyHome(0.7);
+    }
+
+    window.addEventListener("message", function(event) {
+      if (event.data.type === "streamlit:render") {
+        initializeCesium(event.data.args.data);
+      }
+    });
+
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:componentReady",
+      apiVersion: 1
+    }, "*");
+
+    setFrameHeight(680);
+  </script>
+</body>
+</html>
