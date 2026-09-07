@@ -56,32 +56,6 @@ import dataclasses
 import os
 import hashlib
 
-AUTHORIZED_PROJECT = "cadastre-twin"
-
-def verify_runtime():
-    # Secret stored only in your deployment environment
-    secret = os.getenv("CADASTRE_RUNTIME_KEY")
-
-    if not secret:
-        raise RuntimeError(
-            "Unauthorized execution: runtime key not configured."
-        )
-
-    expected = os.getenv("CADASTRE_RUNTIME_HASH")
-
-    if not expected:
-        raise RuntimeError(
-            "Unauthorized execution: project authorization unavailable."
-        )
-
-    actual = hashlib.sha256(
-        f"{AUTHORIZED_PROJECT}:{secret}".encode()
-    ).hexdigest()
-
-    if actual != expected:
-        raise RuntimeError(
-            "Unauthorized execution."
-        )
 def get_web_video_base64(video_path: str) -> str:
     if not video_path or not os.path.exists(video_path):
         return ""
@@ -652,7 +626,6 @@ def generate_synthetic_city() -> CityModel:
         ground_elements=synth_ground,
         vegetation_elements=synth_veg
     )
-verify_runtime()
 
 # ============================================================================
 # 4. ROBUST MULTI-CLASS LIDAR PIPELINE (LAS / LAZ)
